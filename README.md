@@ -13,6 +13,7 @@ A Clarity smart contract implementing time-bound utility tokens for subscription
 - 📊 **Revenue tracking** and analytics
 - ⬆️ **Subscription upgrades** between tiers
 - 🎯 **Bulk operations** for efficiency
+- 🔗 **Referral system** with rewards and viral growth
 
 ## 📋 Subscription Tiers
 
@@ -100,6 +101,34 @@ A Clarity smart contract implementing time-bound utility tokens for subscription
   (list 'SP1111111111 'SP2222222222 'SP3333333333) u1 u1)
 ```
 
+### Referral System
+
+```clarity
+;; Create a referral code with max 10 uses
+(contract-call? .subscription-access-token create-referral-code u10)
+
+;; Subscribe using referral code (10% discount)
+(contract-call? .subscription-access-token subscribe-with-referral u1 u1)
+
+;; Check referral code validity
+(contract-call? .subscription-access-token validate-referral-code u1)
+
+;; Get user's referral rewards
+(contract-call? .subscription-access-token get-referral-rewards 'SP1234567890)
+
+;; Claim earned referral rewards
+(contract-call? .subscription-access-token claim-referral-rewards)
+
+;; Calculate discount for tier
+(contract-call? .subscription-access-token calculate-referral-discount u2)
+
+;; Deactivate your referral code
+(contract-call? .subscription-access-token deactivate-referral-code)
+
+;; Extend referral code uses
+(contract-call? .subscription-access-token extend-referral-code u5)
+```
+
 ### Analytics & Admin
 
 ```clarity
@@ -111,6 +140,9 @@ A Clarity smart contract implementing time-bound utility tokens for subscription
 
 ;; Preview subscription costs
 (contract-call? .subscription-access-token preview-subscription-cost u2 u500)
+
+;; Get referral system stats
+(contract-call? .subscription-access-token get-referral-stats)
 ```
 
 ## 🔧 Admin Functions
@@ -134,6 +166,8 @@ The contract uses several key data structures:
 - **🎚️ Subscription Tiers Map**: Defines tier pricing and access levels  
 - **🎟️ Access Tokens Map**: Manages temporary access tokens
 - **📊 Revenue Tracking Map**: Records revenue by time periods
+- **🔗 Referral Codes Map**: Stores referral codes with usage limits
+- **🎁 Referral Rewards Map**: Tracks earnings for referrers
 
 ## 🧪 Testing
 
@@ -159,6 +193,9 @@ clarinet console
 | 104 | Already subscribed |
 | 105 | Invalid tier |
 | 106 | Insufficient payment |
+| 107 | Invalid referral code |
+| 108 | Cannot refer self |
+| 109 | Referral code already exists |
 
 ## 💡 Use Cases
 

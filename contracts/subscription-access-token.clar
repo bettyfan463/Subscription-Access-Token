@@ -5,11 +5,15 @@
 (define-constant ERR_ALREADY_SUBSCRIBED (err u104))
 (define-constant ERR_INVALID_TIER (err u105))
 (define-constant ERR_INSUFFICIENT_PAYMENT (err u106))
+(define-constant ERR_INVALID_REFERRAL_CODE (err u107))
+(define-constant ERR_CANNOT_REFER_SELF (err u108))
+(define-constant ERR_REFERRAL_CODE_EXISTS (err u109))
 
 (define-constant CONTRACT_OWNER tx-sender)
 
 (define-data-var subscription-counter uint u0)
 (define-data-var token-counter uint u0)
+(define-data-var referral-counter uint u0)
 
 (define-map subscriptions
   { user: principal, tier: uint }
@@ -45,6 +49,31 @@
 (define-map revenue-tracking
   { period: uint }
   { total-revenue: uint, subscriptions-sold: uint }
+)
+
+(define-map referral-codes
+  { code: uint }
+  {
+    referrer: principal,
+    created-at: uint,
+    uses-remaining: uint,
+    total-referrals: uint,
+    active: bool
+  }
+)
+
+(define-map referral-rewards
+  { user: principal }
+  {
+    total-earned: uint,
+    successful-referrals: uint,
+    pending-rewards: uint
+  }
+)
+
+(define-map user-referral-codes
+  { user: principal }
+  { code: uint }
 )
 
 (define-private (update-revenue-stats (amount uint))
@@ -532,4 +561,211 @@
       { tier: u0, current-price: u0, expires-at: u0, is-expired: true }
     )
   )
+)
+
+(define-public (create-referral-code (max-uses uint))
+  (let ((code-id (+ (var-get referral-counter) u1))
+        (existing-code (map-get? user-referral-codes { user: tx-sender })))
+    (asserts! (> max-uses u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= max-uses u100) ERR_INVALID_AMOUNT)
+    (asserts! (is-none existing-code) ERR_REFERRAL_CODE_EXISTS)
+    (map-set referral-codes
+      { code: code-id }
+      {
+        referrer: tx-sender,
+        created-at: stacks-block-height,
+        uses-remaining: max-uses,
+        total-referrals: u0,
+        active: true
+      }
+    )
+    (map-set user-referral-codes
+      { user: tx-sender }
+      { code: code-id }
+    )
+    (var-set referral-counter code-id)
+    (ok { code: code-id, max-uses: max-uses })
+  )
+)
+
+(define-public (subscribe-with-referral (tier uint) (referral-code uint))
+  (let ((tier-info (unwrap! (get-subscription-tier tier) ERR_INVALID_TIER))
+        (price (get price tier-info))
+        (duration (get duration-blocks tier-info))
+        (expires-at (+ stacks-block-height duration))
+        (existing-sub (get-subscription tx-sender tier))
+        (referral (unwrap! (map-get? referral-codes { code: referral-code }) ERR_INVALID_REFERRAL_CODE))
+        (discount-amount (/ price u10))
+        (discounted-price (- price discount-amount)))
+    (asserts! (> tier u0) ERR_INVALID_TIER)
+    (asserts! (<= tier u3) ERR_INVALID_TIER)
+    (asserts! (is-none existing-sub) ERR_ALREADY_SUBSCRIBED)
+    (asserts! (get active referral) ERR_INVALID_REFERRAL_CODE)
+    (asserts! (> (get uses-remaining referral) u0) ERR_INVALID_REFERRAL_CODE)
+    (asserts! (not (is-eq tx-sender (get referrer referral))) ERR_CANNOT_REFER_SELF)
+    (try! (stx-transfer? discounted-price tx-sender CONTRACT_OWNER))
+    (map-set subscriptions
+      { user: tx-sender, tier: tier }
+      {
+        expires-at: expires-at,
+        created-at: stacks-block-height,
+        auto-renew: false,
+        payments-made: u1
+      }
+    )
+    (var-set subscription-counter (+ (var-get subscription-counter) u1))
+    (update-revenue-stats discounted-price)
+    (process-referral-reward referral-code discount-amount)
+    (ok { subscription-id: (var-get subscription-counter), expires-at: expires-at, discount: discount-amount })
+  )
+)
+
+(define-private (process-referral-reward (referral-code uint) (reward-amount uint))
+  (let ((referral (unwrap-panic (map-get? referral-codes { code: referral-code })))
+        (referrer (get referrer referral))
+        (current-rewards (default-to 
+          { total-earned: u0, successful-referrals: u0, pending-rewards: u0 }
+          (map-get? referral-rewards { user: referrer })
+        )))
+    (map-set referral-codes
+      { code: referral-code }
+      {
+        referrer: (get referrer referral),
+        created-at: (get created-at referral),
+        uses-remaining: (- (get uses-remaining referral) u1),
+        total-referrals: (+ (get total-referrals referral) u1),
+        active: (> (- (get uses-remaining referral) u1) u0)
+      }
+    )
+    (map-set referral-rewards
+      { user: referrer }
+      {
+        total-earned: (+ (get total-earned current-rewards) reward-amount),
+        successful-referrals: (+ (get successful-referrals current-rewards) u1),
+        pending-rewards: (+ (get pending-rewards current-rewards) reward-amount)
+      }
+    )
+  )
+)
+
+(define-public (claim-referral-rewards)
+  (let ((rewards (unwrap! (map-get? referral-rewards { user: tx-sender }) ERR_SUBSCRIPTION_NOT_FOUND))
+        (pending-amount (get pending-rewards rewards)))
+    (asserts! (> pending-amount u0) ERR_INVALID_AMOUNT)
+    (try! (as-contract (stx-transfer? pending-amount tx-sender tx-sender)))
+    (map-set referral-rewards
+      { user: tx-sender }
+      {
+        total-earned: (get total-earned rewards),
+        successful-referrals: (get successful-referrals rewards),
+        pending-rewards: u0
+      }
+    )
+    (ok { claimed: pending-amount })
+  )
+)
+
+(define-public (deactivate-referral-code)
+  (let ((user-code (unwrap! (map-get? user-referral-codes { user: tx-sender }) ERR_INVALID_REFERRAL_CODE))
+        (code-id (get code user-code))
+        (referral (unwrap! (map-get? referral-codes { code: code-id }) ERR_INVALID_REFERRAL_CODE)))
+    (map-set referral-codes
+      { code: code-id }
+      {
+        referrer: (get referrer referral),
+        created-at: (get created-at referral),
+        uses-remaining: (get uses-remaining referral),
+        total-referrals: (get total-referrals referral),
+        active: false
+      }
+    )
+    (ok { deactivated: code-id })
+  )
+)
+
+(define-public (extend-referral-code (additional-uses uint))
+  (let ((user-code (unwrap! (map-get? user-referral-codes { user: tx-sender }) ERR_INVALID_REFERRAL_CODE))
+        (code-id (get code user-code))
+        (referral (unwrap! (map-get? referral-codes { code: code-id }) ERR_INVALID_REFERRAL_CODE)))
+    (asserts! (> additional-uses u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= additional-uses u50) ERR_INVALID_AMOUNT)
+    (map-set referral-codes
+      { code: code-id }
+      {
+        referrer: (get referrer referral),
+        created-at: (get created-at referral),
+        uses-remaining: (+ (get uses-remaining referral) additional-uses),
+        total-referrals: (get total-referrals referral),
+        active: true
+      }
+    )
+    (ok { code: code-id, new-uses: (+ (get uses-remaining referral) additional-uses) })
+  )
+)
+
+(define-read-only (get-referral-code (code uint))
+  (map-get? referral-codes { code: code })
+)
+
+(define-read-only (get-user-referral-code (user principal))
+  (match (map-get? user-referral-codes { user: user })
+    user-code (map-get? referral-codes { code: (get code user-code) })
+    none
+  )
+)
+
+(define-read-only (get-referral-rewards (user principal))
+  (default-to 
+    { total-earned: u0, successful-referrals: u0, pending-rewards: u0 }
+    (map-get? referral-rewards { user: user })
+  )
+)
+
+(define-read-only (get-referral-stats)
+  {
+    total-codes-created: (var-get referral-counter),
+    current-block: stacks-block-height
+  }
+)
+
+(define-read-only (validate-referral-code (code uint))
+  (match (map-get? referral-codes { code: code })
+    referral {
+      valid: (and (get active referral) (> (get uses-remaining referral) u0)),
+      uses-remaining: (get uses-remaining referral),
+      total-referrals: (get total-referrals referral),
+      referrer: (get referrer referral)
+    }
+    { valid: false, uses-remaining: u0, total-referrals: u0, referrer: CONTRACT_OWNER }
+  )
+)
+
+(define-read-only (calculate-referral-discount (tier uint))
+  (match (get-subscription-tier tier)
+    tier-info 
+    (let ((price (get price tier-info))
+          (discount (/ price u10)))
+      { original-price: price, discount: discount, final-price: (- price discount) }
+    )
+    { original-price: u0, discount: u0, final-price: u0 }
+  )
+)
+
+(define-public (bulk-referral-subscribe (tier uint) (referral-code uint) (recipients (list 5 principal)))
+  (let ((tier-info (unwrap! (get-subscription-tier tier) ERR_INVALID_TIER))
+        (referral (unwrap! (map-get? referral-codes { code: referral-code }) ERR_INVALID_REFERRAL_CODE))
+        (price (get price tier-info))
+        (discount-amount (/ price u10))
+        (discounted-price (- price discount-amount))
+        (total-cost (* discounted-price (len recipients))))
+    (asserts! (> (len recipients) u0) ERR_INVALID_AMOUNT)
+    (asserts! (get active referral) ERR_INVALID_REFERRAL_CODE)
+    (asserts! (>= (get uses-remaining referral) (len recipients)) ERR_INVALID_REFERRAL_CODE)
+    (try! (stx-transfer? total-cost tx-sender CONTRACT_OWNER))
+    (ok (map process-bulk-referral recipients))
+  )
+)
+
+(define-private (process-bulk-referral (recipient principal))
+  { recipient: recipient, success: true }
 )
