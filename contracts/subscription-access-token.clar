@@ -8,12 +8,15 @@
 (define-constant ERR_INVALID_REFERRAL_CODE (err u107))
 (define-constant ERR_CANNOT_REFER_SELF (err u108))
 (define-constant ERR_REFERRAL_CODE_EXISTS (err u109))
+(define-constant ERR_INSUFFICIENT_LOYALTY_POINTS (err u110))
+(define-constant ERR_INVALID_REDEMPTION (err u111))
 
 (define-constant CONTRACT_OWNER tx-sender)
 
 (define-data-var subscription-counter uint u0)
 (define-data-var token-counter uint u0)
 (define-data-var referral-counter uint u0)
+(define-data-var loyalty-points-per-block uint u1)
 
 (define-map subscriptions
   { user: principal, tier: uint }
@@ -74,6 +77,15 @@
 (define-map user-referral-codes
   { user: principal }
   { code: uint }
+)
+
+(define-map loyalty-points
+  { user: principal }
+  {
+    total-points: uint,
+    last-updated: uint,
+    redeemed-points: uint
+  }
 )
 
 (define-private (update-revenue-stats (amount uint))
@@ -768,4 +780,119 @@
 
 (define-private (process-bulk-referral (recipient principal))
   { recipient: recipient, success: true }
+)
+
+(define-private (calculate-loyalty-points (user principal) (tier uint))
+  (let ((subscription (get-subscription user tier))
+        (current-points (default-to
+          { total-points: u0, last-updated: stacks-block-height, redeemed-points: u0 }
+          (map-get? loyalty-points { user: user })
+        )))
+    (match subscription
+      sub (let ((blocks-held (- stacks-block-height (get last-updated current-points)))
+                (tier-multiplier (if (is-eq tier u3) u3 (if (is-eq tier u2) u2 u1)))
+                (new-points (* (* blocks-held (var-get loyalty-points-per-block)) tier-multiplier)))
+            (+ (get total-points current-points) new-points))
+      (get total-points current-points)
+    )
+  )
+)
+
+(define-public (sync-loyalty-points (tier uint))
+  (let ((user-points (default-to
+          { total-points: u0, last-updated: stacks-block-height, redeemed-points: u0 }
+          (map-get? loyalty-points { user: tx-sender })
+        ))
+        (calculated-points (calculate-loyalty-points tx-sender tier)))
+    (map-set loyalty-points
+      { user: tx-sender }
+      {
+        total-points: calculated-points,
+        last-updated: stacks-block-height,
+        redeemed-points: (get redeemed-points user-points)
+      }
+    )
+    (ok { synced-points: calculated-points })
+  )
+)
+
+(define-public (redeem-loyalty-for-extension (tier uint) (points-to-redeem uint))
+  (let ((user-points (unwrap! (map-get? loyalty-points { user: tx-sender }) ERR_SUBSCRIPTION_NOT_FOUND))
+        (available-points (- (get total-points user-points) (get redeemed-points user-points)))
+        (existing-sub (unwrap! (get-subscription tx-sender tier) ERR_SUBSCRIPTION_NOT_FOUND))
+        (blocks-to-extend (/ points-to-redeem (var-get loyalty-points-per-block))))
+    (asserts! (> points-to-redeem u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= available-points points-to-redeem) ERR_INSUFFICIENT_LOYALTY_POINTS)
+    (asserts! (> blocks-to-extend u0) ERR_INVALID_REDEMPTION)
+    (map-set subscriptions
+      { user: tx-sender, tier: tier }
+      {
+        expires-at: (+ (get expires-at existing-sub) blocks-to-extend),
+        created-at: (get created-at existing-sub),
+        auto-renew: (get auto-renew existing-sub),
+        payments-made: (get payments-made existing-sub)
+      }
+    )
+    (map-set loyalty-points
+      { user: tx-sender }
+      {
+        total-points: (get total-points user-points),
+        last-updated: stacks-block-height,
+        redeemed-points: (+ (get redeemed-points user-points) points-to-redeem)
+      }
+    )
+    (ok { redeemed: points-to-redeem, extension-blocks: blocks-to-extend })
+  )
+)
+
+(define-public (redeem-loyalty-for-token (tier uint) (points-to-redeem uint))
+  (let ((user-points (unwrap! (map-get? loyalty-points { user: tx-sender }) ERR_SUBSCRIPTION_NOT_FOUND))
+        (available-points (- (get total-points user-points) (get redeemed-points user-points)))
+        (token-id (+ (var-get token-counter) u1))
+        (tier-info (unwrap! (get-subscription-tier tier) ERR_INVALID_TIER))
+        (duration (get duration-blocks tier-info))
+        (expires-at (+ stacks-block-height duration)))
+    (asserts! (> points-to-redeem u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= available-points points-to-redeem) ERR_INSUFFICIENT_LOYALTY_POINTS)
+    (asserts! (>= points-to-redeem u100) ERR_INVALID_REDEMPTION)
+    (map-set access-tokens
+      { token-id: token-id }
+      {
+        user: tx-sender,
+        tier: tier,
+        issued-at: stacks-block-height,
+        expires-at: expires-at,
+        used: false
+      }
+    )
+    (map-set loyalty-points
+      { user: tx-sender }
+      {
+        total-points: (get total-points user-points),
+        last-updated: stacks-block-height,
+        redeemed-points: (+ (get redeemed-points user-points) points-to-redeem)
+      }
+    )
+    (var-set token-counter token-id)
+    (ok { token-id: token-id, redeemed-points: points-to-redeem, expires-at: expires-at })
+  )
+)
+
+(define-read-only (get-loyalty-points (user principal))
+  (default-to
+    { total-points: u0, last-updated: stacks-block-height, redeemed-points: u0 }
+    (map-get? loyalty-points { user: user })
+  )
+)
+
+(define-read-only (get-available-loyalty-points (user principal))
+  (let ((user-points (get-loyalty-points user)))
+    (- (get total-points user-points) (get redeemed-points user-points))
+  )
+)
+
+(define-read-only (estimate-loyalty-points (user principal) (tier uint) (blocks uint))
+  (let ((tier-multiplier (if (is-eq tier u3) u3 (if (is-eq tier u2) u2 u1))))
+    (* (* blocks (var-get loyalty-points-per-block)) tier-multiplier)
+  )
 )
