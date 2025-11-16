@@ -11,12 +11,17 @@
 (define-constant ERR_INSUFFICIENT_LOYALTY_POINTS (err u110))
 (define-constant ERR_INVALID_REDEMPTION (err u111))
 
+(define-constant ERR_VOUCHER_INVALID (err u112))
+(define-constant ERR_VOUCHER_NOT_FOUND (err u113))
+
 (define-constant CONTRACT_OWNER tx-sender)
 
 (define-data-var subscription-counter uint u0)
 (define-data-var token-counter uint u0)
 (define-data-var referral-counter uint u0)
 (define-data-var loyalty-points-per-block uint u1)
+
+(define-data-var voucher-counter uint u0)
 
 (define-map subscriptions
   { user: principal, tier: uint }
@@ -85,6 +90,18 @@
     total-points: uint,
     last-updated: uint,
     redeemed-points: uint
+  }
+)
+
+(define-map vouchers
+  { id: uint }
+  {
+    tier: uint,
+    duration-blocks: uint,
+    creator: principal,
+    created-at: uint,
+    uses-remaining: uint,
+    active: bool
   }
 )
 
@@ -894,5 +911,86 @@
 (define-read-only (estimate-loyalty-points (user principal) (tier uint) (blocks uint))
   (let ((tier-multiplier (if (is-eq tier u3) u3 (if (is-eq tier u2) u2 u1))))
     (* (* blocks (var-get loyalty-points-per-block)) tier-multiplier)
+  )
+)
+
+(define-read-only (get-voucher (id uint))
+  (map-get? vouchers { id: id })
+)
+
+(define-public (create-voucher (tier uint) (duration-blocks uint) (max-uses uint))
+  (let ((tier-info (unwrap! (get-subscription-tier tier) ERR_INVALID_TIER))
+        (id (+ (var-get voucher-counter) u1)))
+    (asserts! (> tier u0) ERR_INVALID_TIER)
+    (asserts! (<= tier u3) ERR_INVALID_TIER)
+    (asserts! (> duration-blocks u0) ERR_INVALID_AMOUNT)
+    (asserts! (> max-uses u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= max-uses u100) ERR_INVALID_AMOUNT)
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set vouchers
+      { id: id }
+      {
+        tier: tier,
+        duration-blocks: duration-blocks,
+        creator: tx-sender,
+        created-at: stacks-block-height,
+        uses-remaining: max-uses,
+        active: true
+      }
+    )
+    (var-set voucher-counter id)
+    (ok { voucher-id: id, tier: tier, max-uses: max-uses })
+  )
+)
+
+(define-public (redeem-voucher (voucher-id uint))
+  (let ((voucher (unwrap! (map-get? vouchers { id: voucher-id }) ERR_VOUCHER_NOT_FOUND))
+        (tier (get tier voucher))
+        (duration (get duration-blocks voucher))
+        (expires-at (+ stacks-block-height duration))
+        (existing-sub (get-subscription tx-sender tier)))
+    (asserts! (get active voucher) ERR_VOUCHER_INVALID)
+    (asserts! (> (get uses-remaining voucher) u0) ERR_VOUCHER_INVALID)
+    (asserts! (is-none existing-sub) ERR_ALREADY_SUBSCRIBED)
+    (map-set subscriptions
+      { user: tx-sender, tier: tier }
+      {
+        expires-at: expires-at,
+        created-at: stacks-block-height,
+        auto-renew: false,
+        payments-made: u0
+      }
+    )
+    (map-set vouchers
+      { id: voucher-id }
+      {
+        tier: (get tier voucher),
+        duration-blocks: (get duration-blocks voucher),
+        creator: (get creator voucher),
+        created-at: (get created-at voucher),
+        uses-remaining: (- (get uses-remaining voucher) u1),
+        active: (> (- (get uses-remaining voucher) u1) u0)
+      }
+    )
+    (var-set subscription-counter (+ (var-get subscription-counter) u1))
+    (ok { subscription-id: (var-get subscription-counter), tier: tier, expires-at: expires-at })
+  )
+)
+
+(define-public (deactivate-voucher (voucher-id uint))
+  (let ((voucher (unwrap! (map-get? vouchers { id: voucher-id }) ERR_VOUCHER_NOT_FOUND)))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set vouchers
+      { id: voucher-id }
+      {
+        tier: (get tier voucher),
+        duration-blocks: (get duration-blocks voucher),
+        creator: (get creator voucher),
+        created-at: (get created-at voucher),
+        uses-remaining: (get uses-remaining voucher),
+        active: false
+      }
+    )
+    (ok { deactivated: voucher-id })
   )
 )
