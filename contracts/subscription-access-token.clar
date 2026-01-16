@@ -13,6 +13,8 @@
 
 (define-constant ERR_VOUCHER_INVALID (err u112))
 (define-constant ERR_VOUCHER_NOT_FOUND (err u113))
+(define-constant ERR_INSUFFICIENT_BALANCE (err u114))
+(define-constant ERR_NO_RENEWAL_NEEDED (err u115))
 
 (define-constant CONTRACT_OWNER tx-sender)
 
@@ -992,5 +994,76 @@
       }
     )
     (ok { deactivated: voucher-id })
+  )
+)
+
+(define-map user-balances 
+  { user: principal } 
+  { amount: uint }
+)
+
+(define-read-only (get-balance (user principal))
+  (default-to 
+    { amount: u0 } 
+    (map-get? user-balances { user: user })
+  )
+)
+
+(define-public (deposit-balance (amount uint))
+  (let ((current-balance (get amount (get-balance tx-sender))))
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set user-balances 
+      { user: tx-sender } 
+      { amount: (+ current-balance amount) }
+    )
+    (ok { new-balance: (+ current-balance amount) })
+  )
+)
+
+(define-public (withdraw-balance (amount uint))
+  (let ((current-balance (get amount (get-balance tx-sender))))
+    (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    (map-set user-balances 
+      { user: tx-sender } 
+      { amount: (- current-balance amount) }
+    )
+    (ok { withdrawn: amount, remaining: (- current-balance amount) })
+  )
+)
+
+(define-public (trigger-auto-renew (user principal) (tier uint))
+  (let ((tier-info (unwrap! (get-subscription-tier tier) ERR_INVALID_TIER))
+        (price (get price tier-info))
+        (duration (get duration-blocks tier-info))
+        (existing-sub (unwrap! (get-subscription user tier) ERR_SUBSCRIPTION_NOT_FOUND))
+        (user-balance (get amount (get-balance user)))
+        (blocks-remaining (if (> (get expires-at existing-sub) stacks-block-height)
+                              (- (get expires-at existing-sub) stacks-block-height)
+                              u0)))
+    (asserts! (get auto-renew existing-sub) ERR_UNAUTHORIZED)
+    (asserts! (<= blocks-remaining u144) ERR_NO_RENEWAL_NEEDED)
+    (asserts! (>= user-balance price) ERR_INSUFFICIENT_BALANCE)
+    (try! (as-contract (stx-transfer? price tx-sender CONTRACT_OWNER)))
+    (map-set user-balances 
+      { user: user } 
+      { amount: (- user-balance price) }
+    )
+    (map-set subscriptions
+      { user: user, tier: tier }
+      {
+        expires-at: (+ (if (> (get expires-at existing-sub) stacks-block-height)
+                           (get expires-at existing-sub)
+                           stacks-block-height)
+                       duration),
+        created-at: (get created-at existing-sub),
+        auto-renew: true,
+        payments-made: (+ (get payments-made existing-sub) u1)
+      }
+    )
+    (update-revenue-stats price)
+    (ok { renewed: true, user: user, tier: tier })
   )
 )
