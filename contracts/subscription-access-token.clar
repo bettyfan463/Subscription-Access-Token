@@ -15,6 +15,9 @@
 (define-constant ERR_VOUCHER_NOT_FOUND (err u113))
 (define-constant ERR_INSUFFICIENT_BALANCE (err u114))
 (define-constant ERR_NO_RENEWAL_NEEDED (err u115))
+(define-constant ERR_TEAM_FULL (err u116))
+(define-constant ERR_ALREADY_IN_TEAM (err u117))
+(define-constant ERR_NOT_TEAM_MEMBER (err u118))
 
 (define-constant CONTRACT_OWNER tx-sender)
 
@@ -105,6 +108,16 @@
     uses-remaining: uint,
     active: bool
   }
+)
+
+(define-map team-memberships 
+  { member: principal } 
+  { manager: principal, joined-at: uint }
+)
+
+(define-map team-counts 
+  { manager: principal } 
+  { count: uint }
 )
 
 (define-private (update-revenue-stats (amount uint))
@@ -1065,5 +1078,67 @@
     )
     (update-revenue-stats price)
     (ok { renewed: true, user: user, tier: tier })
+  )
+)
+
+(define-read-only (get-team-limit (tier uint))
+  (if (is-eq tier u3) u10
+    (if (is-eq tier u2) u3
+      u0))
+)
+
+(define-public (add-team-member (member principal))
+  (let ((tier-3-active (is-subscription-active tx-sender u3))
+        (tier-2-active (is-subscription-active tx-sender u2))
+        (current-tier (if tier-3-active u3 (if tier-2-active u2 u1)))
+        (limit (get-team-limit current-tier))
+        (current-count (default-to u0 (get count (map-get? team-counts { manager: tx-sender }))))
+        (existing-membership (map-get? team-memberships { member: member })))
+    (asserts! (or tier-3-active tier-2-active) ERR_SUBSCRIPTION_EXPIRED)
+    (asserts! (< current-count limit) ERR_TEAM_FULL)
+    (asserts! (is-none existing-membership) ERR_ALREADY_IN_TEAM)
+    (asserts! (not (is-eq member tx-sender)) ERR_INVALID_REDEMPTION)
+    
+    (map-set team-memberships 
+      { member: member }
+      { manager: tx-sender, joined-at: stacks-block-height }
+    )
+    (map-set team-counts
+      { manager: tx-sender }
+      { count: (+ current-count u1) }
+    )
+    (ok { added: member, count: (+ current-count u1) })
+  )
+)
+
+(define-public (remove-team-member (member principal))
+  (let ((membership (unwrap! (map-get? team-memberships { member: member }) ERR_NOT_TEAM_MEMBER))
+        (current-count (default-to u0 (get count (map-get? team-counts { manager: tx-sender })))))
+    (asserts! (is-eq (get manager membership) tx-sender) ERR_UNAUTHORIZED)
+    (map-delete team-memberships { member: member })
+    (map-set team-counts
+      { manager: tx-sender }
+      { count: (- current-count u1) }
+    )
+    (ok { removed: member, count: (- current-count u1) })
+  )
+)
+
+(define-read-only (get-team-access (user principal))
+  (match (map-get? team-memberships { member: user })
+    membership 
+    (let ((manager (get manager membership))
+          (tier-3-active (is-subscription-active manager u3))
+          (tier-2-active (is-subscription-active manager u2)))
+      (if (or tier-3-active tier-2-active)
+        (ok { 
+          active: true, 
+          tier: (if tier-3-active u3 u2), 
+          manager: manager 
+        })
+        (ok { active: false, tier: u0, manager: manager })
+      )
+    )
+    (ok { active: false, tier: u0, manager: user })
   )
 )
